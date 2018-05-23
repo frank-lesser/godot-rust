@@ -149,6 +149,7 @@ pub enum VariantType {
 }
 
 impl VariantType {
+    #[doc(hidden)]
     pub fn from_sys(v: sys::godot_variant_type) -> VariantType {
         unsafe { transmute(v) }
     }
@@ -242,13 +243,13 @@ impl Variant {
     }
 
     /// Creates a `Variant` wrapping a Godot object.
-    pub fn from_object<T>(o: GodotRef<T>) -> Variant
-        where T: GodotClass
+    pub fn from_object<T>(val: T) -> Variant
+        where T: GodotObject
     {
         unsafe {
             let api = get_api();
             let mut dest = sys::godot_variant::default();
-            (api.godot_variant_new_object)(&mut dest, o.this);
+            (api.godot_variant_new_object)(&mut dest, val.to_sys());
             Variant(dest)
         }
     }
@@ -412,18 +413,17 @@ impl Variant {
         pub fn try_to_dictionary(&self) -> Option<Dictionary> : godot_variant_as_dictionary;
     );
 
-    pub fn try_to_object<T>(&self) -> Option<GodotRef<T>>
-        where T: GodotClass
+    pub fn try_to_object<T>(&self) -> Option<T>
+        where T: GodotObject
     {
         use sys::godot_variant_type::*;
         unsafe {
             let api = get_api();
-            if (api.godot_variant_get_type)(&self.0) == GODOT_VARIANT_TYPE_OBJECT {
-                let obj = GodotRef::<Object>::from_raw((api.godot_variant_as_object)(&self.0));
-                obj.cast::<T>()
-            } else {
-                None
+            if (api.godot_variant_get_type)(&self.0) != GODOT_VARIANT_TYPE_OBJECT {
+                return None;
             }
+            let obj = Object::from_sys((api.godot_variant_as_object)(&self.0));
+            obj.cast::<T>()
         }
     }
 
@@ -508,10 +508,11 @@ impl Variant {
         v
     }
 
-    /// Returns a copy of the internal ffi representation of the variant.
-    ///
-    /// The variant remains owned by the rust wrapper and the receiver of
-    /// the ffi representation should not run its destructor.
+    // Returns a copy of the internal ffi representation of the variant.
+    //
+    // The variant remains owned by the rust wrapper and the receiver of
+    // the ffi representation should not run its destructor.
+    #[doc(hidden)]
     pub fn to_sys(&self) -> sys::godot_variant {
         self.0
     }
@@ -598,11 +599,11 @@ impl<'l> From<&'l str> for Variant {
     }
 }
 
-impl <T> From<GodotRef<T>> for Variant
-    where T: GodotClass
+impl <T> From<T> for Variant
+    where T: GodotObject
 {
-    fn from(o: GodotRef<T>) -> Variant {
-        Variant::from_object(o)
+    fn from(val: T) -> Variant {
+        Variant::from_object(val)
     }
 }
 

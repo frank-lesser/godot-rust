@@ -1,0 +1,14 @@
+[entry]
+
+X11.64="../../target/debug/libmanually_registered.so"
+
+[dependencies]
+
+X11.64=[  ]
+
+[general]
+
+singleton=false
+load_once=true
+symbol_prefix="godot_rust_"
+reloadable=true

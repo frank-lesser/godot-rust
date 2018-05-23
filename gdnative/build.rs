@@ -5,7 +5,7 @@ extern crate serde_json;
 extern crate serde_derive;
 extern crate heck;
 
-use heck::CamelCase;
+use heck::{CamelCase, SnakeCase};
 
 use std::fs::File;
 use std::env;
@@ -122,7 +122,7 @@ impl Ty {
             &Ty::Result => Some(String::from("GodotResult")),
             &Ty::VariantType => Some(String::from("VariantType")),
             &Ty::Enum(_) => None, // TODO
-            &Ty::Object(ref name) => Some(format!("Option<GodotRef<{}>>", name)),
+            &Ty::Object(ref name) => Some(format!("Option<{}>", name)),
         }
     }
 
@@ -170,21 +170,80 @@ fn main() {
 
     let mut output = File::create(out_path.join("types.rs")).unwrap();
 
-    for class in classes {
-        writeln!(output, r#"
-#[allow(non_camel_case_types)]
-pub struct {name} {{
-    info: GodotClassInfo,
-"#, name = class.name).unwrap();
-        if class.base_class != "" {
-            writeln!(output, r#"
-    parent: {parent},
-            "#, parent = class.base_class).unwrap();
-        }
-        writeln!(output, r#"
-}}
+    writeln!(output, "use std::ptr;").unwrap();
+    writeln!(output, "use std::mem;").unwrap();
+    writeln!(output, "use object;").unwrap();
 
-"#).unwrap();
+    for class in classes {
+        let has_parent = class.base_class != "";
+        let singleton_str = if class.singleton { "singleton " } else { "" } ;
+        let ownership_type = if class.is_reference { "reference counted" } else { "manually managed" };
+        if has_parent {
+            writeln!(output, r#"
+/// `{api_type} {singleton}class {name} : {base_class}` ({ownership_type})"#,
+                api_type = class.api_type,
+                name = class.name,
+                base_class = class.base_class,
+                ownership_type = ownership_type,
+                singleton = singleton_str
+            ).unwrap();
+        } else {
+            writeln!(output, r#"
+/// `{api_type} {singleton}class {name}` ({ownership_type})"#,
+                api_type = class.api_type,
+                name = class.name,
+                ownership_type = ownership_type,
+                singleton = singleton_str
+            ).unwrap();
+        }
+
+        if class.base_class != "" {
+            writeln!(output,
+r#"///
+/// ## Base class
+///
+/// {name} inherits [{base_class}](struct.{base_class}.html) and all of its methods."#,
+                name = class.name,
+                base_class = class.base_class
+            ).unwrap();
+        }
+
+        if class.is_reference {
+            writeln!(output,
+r#"///
+/// ## Memory management
+///
+/// The lifetime of this object is automatically managed through reference counting."#
+            ).unwrap();
+        } else if class.instanciable {
+            writeln!(output,
+r#"///
+/// ## Memory management
+///
+/// Non reference counted objects such as the ones of this type are usually owned by the engine.
+/// In the cases where Rust code owns an object of this type, ownership should be either passed
+/// to the engine or the object must be manually destroyed using `{}::free`."#,
+                class.name
+            ).unwrap();
+        }
+
+        if class.api_type == "tools" {
+            writeln!(output,
+r#"///
+/// ## Tool
+///
+/// This class is used to interact with godot's editor."#,
+            ).unwrap();
+        }
+
+        writeln!(output,
+r#"#[allow(non_camel_case_types)]
+pub struct {name} {{
+    this: *mut sys::godot_object,
+}}
+"#,
+            name = class.name
+        ).unwrap();
 
         for e in &class.enums {
             // TODO: check whether the start of the variant name is
@@ -192,6 +251,7 @@ pub struct {name} {{
             // it. For example ImageFormat::Rgb8 instead of ImageFormat::FormatRgb8.
             writeln!(output, r#"
 #[repr(u32)]
+#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum {class_name}{enum_name} {{
 "#, class_name = class.name, enum_name = e.name
@@ -201,7 +261,9 @@ pub enum {class_name}{enum_name} {{
                 let key = key.as_str().to_camel_case();
                 writeln!(output,
 r#"    {key} = {val},"#,
-                key = key.as_str().to_camel_case(), val = val).unwrap();
+                    key = key,
+                    val = val
+                ).unwrap();
             }
             writeln!(output, r#"
 }}"#
@@ -209,80 +271,247 @@ r#"    {key} = {val},"#,
         }
 
         writeln!(output, r#"
+#[doc(hidden)]
+#[allow(non_camel_case_types)]
+pub struct {name}MethodTable {{
+    pub class_constructor: sys::godot_class_constructor,"#,
+            name = class.name
+        ).unwrap();
 
-unsafe impl GodotClass for {name} {{
-    type ClassData = {name};
-    type Reference = {name};
-
-    fn godot_name() -> &'static str {{
-        "{name}"
-    }}
-
-    unsafe fn register_class(_desc: *mut libc::c_void) {{
-        panic!("Can't register");
-    }}
-
-    fn godot_info(&self) -> &GodotClassInfo {{
-        &self.info
-    }}
-    unsafe fn reference(_this: *mut sys::godot_object, data: &Self::ClassData) -> &Self::Reference {{
-        data
-    }}
-    unsafe fn from_object(obj: *mut sys::godot_object) -> Self {{
-        {name} {{
-            info: GodotClassInfo {{
-                this: obj,
-            }},
-"#, name = class.name).unwrap();
-        if class.base_class != "" {
-            writeln!(output, r#"
-            parent: {parent}::from_object(obj),
-            "#, parent = class.base_class).unwrap();
+        for method in &class.methods {
+            let method_name = method.get_name();
+            if skip_method(&method_name) {
+                continue;
+            }
+            writeln!(output, "    pub {}: *mut sys::godot_method_bind,", method_name).unwrap();
         }
+        writeln!(output, r#"
+}}
+
+impl {name}MethodTable {{
+    unsafe fn get_mut() -> &'static mut Self {{
+        static mut TABLE: {name}MethodTable = {name}MethodTable {{
+            class_constructor: None,"#,
+            name = class.name
+        ).unwrap();
+        for method in &class.methods {
+            let method_name = method.get_name();
+            if skip_method(&method_name) {
+                continue;
+            }
+            writeln!(output,
+"            {}: 0 as *mut sys::godot_method_bind,",
+                method.get_name()
+            ).unwrap();
+        }
+        writeln!(output, r#"
+        }};
+
+        &mut TABLE
+    }}
+
+    pub unsafe fn unchecked_get() -> &'static Self {{
+        Self::get_mut()
+    }}
+
+    pub fn get(api: &GodotApi) -> &'static Self {{
+        unsafe {{
+            let table = Self::get_mut();
+            static INIT: Once = ONCE_INIT;
+            INIT.call_once(|| {{
+                {name}MethodTable::init(table, api);
+            }});
+
+            table
+        }}
+    }}
+
+    #[inline(never)]
+    fn init(table: &mut Self, api: &GodotApi) {{
+        unsafe {{
+            let class_name = b"{name}\0".as_ptr() as *const i8;
+            table.class_constructor = (api.godot_get_class_constructor)(class_name);"#,
+                name = class.name
+            ).unwrap();
+        for method in &class.methods {
+            let method_name = method.get_name();
+            if skip_method(&method_name) {
+                continue;
+            }
+
+            writeln!(output,
+r#"            table.{method_name} = (api.godot_method_bind_get_method)(class_name, "{method_name}\0".as_ptr() as *const i8 );"#,
+                method_name = method_name
+            ).unwrap();
+        }
+
         writeln!(output, r#"
         }}
     }}
+}}"#
+        ).unwrap();
+
+
+        writeln!(output, r#"
+
+unsafe impl GodotObject for {name} {{
+    fn class_name() -> &'static str {{
+        "{name}"
+    }}
+
+    unsafe fn from_sys(obj: *mut sys::godot_object) -> Self {{
+        {addref_if_reference}
+        Self {{ this: obj, }}
+    }}
+
+    unsafe fn to_sys(&self) -> *mut sys::godot_object {{
+        self.this
+    }}
 }}
-"#).unwrap();
+
+"#,
+            name = class.name,
+            addref_if_reference = if class.is_reference { "object::add_ref(obj);" } else { "" }
+        ).unwrap();
+
         if class.base_class != "" {
             writeln!(output, r#"
 impl Deref for {name} {{
     type Target = {parent};
     fn deref(&self) -> &Self::Target {{
-        &self.parent
+        unsafe {{
+            mem::transmute(self)
+        }}
     }}
 }}
-            "#, name = class.name, parent = class.base_class).unwrap();
+
+impl DerefMut for {name} {{
+    fn deref_mut(&mut self) -> &mut Self::Target {{
+        unsafe {{
+            mem::transmute(self)
+        }}
+    }}
+}}
+"#,             name = class.name,
+                parent = class.base_class
+            ).unwrap();
         }
+
+
         writeln!(output, r#"
 impl {name} {{"#, name = class.name
         ).unwrap();
 
-        if class.singleton {
-            let s_name = if class.name.starts_with("_") {
-                &class.name[1..]
-            } else {
-                class.name.as_ref()
-            };
+        let s_name = if class.name.starts_with("_") {
+            &class.name[1..]
+        } else {
+            class.name.as_ref()
+        };
+
+        if class.base_class != "" {
             writeln!(output, r#"
-    pub fn godot_singleton() -> GodotRef<{name}> {{
+    /// Up-cast.
+    pub fn as_{parent_sc}(&self) -> {parent} {{
+        unsafe {{ {parent}::from_sys(self.this) }}
+    }}"#,
+                parent = class.base_class,
+                parent_sc = class_name_to_snake_case(&class.base_class)
+            ).unwrap();
+        }
+
+        if class.singleton {
+            writeln!(output, r#"
+    pub fn godot_singleton() -> Self {{
         unsafe {{
-            let obj = (get_api().godot_global_get_singleton)(b"{s_name}\0".as_ptr() as *mut _);
-            GodotRef::from_raw(obj as *mut _)
+            let this = (get_api().godot_global_get_singleton)(b"{s_name}\0".as_ptr() as *mut _);
+
+            {name} {{
+                this
+            }}
         }}
     }}
             "#, name = class.name, s_name = s_name).unwrap();
         }
 
+        if class.instanciable {
+
+            if class.is_reference {
+                writeln!(output,
+r#"
+    // Constructor
+    pub fn new() -> Self {{
+        unsafe {{
+            let api = get_api();
+            let ctor = {name}MethodTable::get(api).class_constructor.unwrap();
+            let obj = ctor();
+            object::init_ref_count(obj);
+
+            {name} {{
+                this: obj
+            }}
+        }}
+    }}
+
+    /// Creates a new reference to the same object.
+    pub fn new_ref(&self) -> Self {{
+        unsafe {{
+            object::add_ref(self.this);
+
+            Self {{
+                this: self.this,
+            }}
+        }}
+    }}
+"#,
+                    name = class.name
+                ).unwrap();
+            } else {
+
+                writeln!(output,
+r#"
+    /// Constructor.
+    ///
+    /// Because this type is not reference counted, the lifetime of the returned object
+    /// is *not* automatically managed.
+    /// Immediately after creation, the object is owned by the caller, and can be
+    /// passed to the engine (in which case the engine will be responsible for
+    /// destroying the object) or destroyed manually using `{name}::free`.
+    pub fn new() -> Self {{
+        unsafe {{
+            let api = get_api();
+            let ctor = {name}MethodTable::get(api).class_constructor.unwrap();
+            let this = ctor();
+
+            {name} {{
+                this
+            }}
+        }}
+    }}
+
+    /// Manually deallocate the object.
+    pub unsafe fn free(self) {{
+        (get_api().godot_object_destroy)(self.this);
+    }}
+"#,
+                    name = class.name
+                ).unwrap();
+            }
+        }
+
         'method:
         for method in class.methods {
+            let method_name = method.get_name();
+
+            if skip_method(&method_name) {
+                continue 'method;
+            }
+
             let rust_ret_type = if let Some(ty) = method.get_return_type().to_rust() {
                 ty
             } else {
                 continue
             };
 
-            let mut type_params = String::new();
             let mut params = String::new();
             for argument in &method.arguments {
                 if let Some(ty) = argument.get_type().to_rust() {
@@ -296,68 +525,72 @@ impl {name} {{"#, name = class.name
                 params.push_str(", varargs: &[Variant]");
             }
 
+            let self_param = if method.is_const {
+                "&self"
+            } else {
+                "&mut self"
+            };
+
             writeln!(output, r#"
 
-    pub fn {name}<{type_params}>(&self{params}) -> {rust_ret_type} {{
-        use std::ptr;
+    pub fn {name}({self_param}{params}) -> {rust_ret_type} {{
         unsafe {{
             let api = ::get_api();
-            static mut METHOD_BIND: *mut sys::godot_method_bind = 0 as _;
-            static INIT: Once = ONCE_INIT;
-            INIT.call_once(|| {{
-                let class = b"{cname}\0".as_ptr();
-                let method = b"{name}\0".as_ptr();
-                METHOD_BIND = (api.godot_method_bind_get_method)(
-                    class as *const _,
-                    method as *const _
-                );
-                debug_assert!(!METHOD_BIND.is_null());
-            }});
 
-            "#, cname = class.name, name = method.name, rust_ret_type = rust_ret_type, params = params,
-                type_params = type_params).unwrap();
+            let method_bind: *mut sys::godot_method_bind = {cname}MethodTable::get(api).{name};"#,
+                cname = class.name,
+                name = method_name,
+                rust_ret_type = rust_ret_type,
+                params = params,
+                self_param = self_param,
+            ).unwrap();
             if method.has_varargs {
-                writeln!(output, r#"
-            let mut argument_buffer: Vec<*const sys::godot_variant> = Vec::with_capacity({arg_count} + varargs.len());
-                "#, arg_count = method.arguments.len()).unwrap();
+                writeln!(output,
+r#"            let mut argument_buffer: Vec<*const sys::godot_variant> = Vec::with_capacity({arg_count} + varargs.len());"#,
+                    arg_count = method.arguments.len()
+                ).unwrap();
 
                 for argument in &method.arguments {
                     let ty = argument.get_type().to_rust().unwrap();
                     if ty.starts_with("Option") {
-                        writeln!(output, r#"
-                let {name}: Variant = if let Some(o) = {name} {{
+                        writeln!(output,
+r#"             let {name}: Variant = if let Some(o) = {name} {{
                     o.into()
-                }} else {{ Variant::new() }};
-                        "#, name = rust_safe_name(&argument.name)).unwrap();
+                }} else {{ Variant::new() }};"#,
+                            name = rust_safe_name(&argument.name)
+                        ).unwrap();
                     } else if ty == "GodotString" {
-                        writeln!(output, r#"
-                let {name}: Variant = Variant::from_godot_string(&{name});
-                        "#, name = rust_safe_name(&argument.name)).unwrap();
+                        writeln!(output,
+r#"             let {name}: Variant = Variant::from_godot_string(&{name});"#,
+                            name = rust_safe_name(&argument.name)
+                        ).unwrap();
                     } else {
                         writeln!(output, r#"
-                let {name}: Variant = {name}.into();
-                        "#, name = rust_safe_name(&argument.name)).unwrap();
+                let {name}: Variant = {name}.into();"#,
+                            name = rust_safe_name(&argument.name)
+                        ).unwrap();
                     }
-                    writeln!(output, r#"
-            argument_buffer.push(&{name}.0);
-                    "#, name = rust_safe_name(&argument.name)).unwrap();
+                    writeln!(output,
+r#"            argument_buffer.push(&{name}.0); "#,
+                        name = rust_safe_name(&argument.name)
+                    ).unwrap();
                 }
 
                 writeln!(output, r#"
             for arg in varargs {{
                 argument_buffer.push(&arg.0 as *const _);
             }}
-            let ret = Variant((api.godot_method_bind_call)(METHOD_BIND, self.info.this, argument_buffer.as_mut_ptr(), argument_buffer.len() as _, ptr::null_mut()));
-                "#).unwrap();
+            let ret = Variant((api.godot_method_bind_call)(method_bind, self.this, argument_buffer.as_mut_ptr(), argument_buffer.len() as _, ptr::null_mut()));"#
+                ).unwrap();
 
                 if rust_ret_type.starts_with("Option") {
-                    writeln!(output, r#"
-                ret.try_to_object()
-                    "#).unwrap();
+                    writeln!(output,
+r#"                ret.try_to_object()"#
+                    ).unwrap();
                 } else {
-                    writeln!(output, r#"
-                ret.into()
-                    "#).unwrap();
+                    writeln!(output,
+r#"                ret.into()"#
+                    ).unwrap();
                 }
 
             } else {
@@ -372,19 +605,47 @@ impl {name} {{"#, name = class.name
                 godot_handle_return_pre(&mut output, &method.get_return_type());
 
                 writeln!(output, r#"
-            (api.godot_method_bind_ptrcall)(METHOD_BIND, self.info.this, argument_buffer.as_mut_ptr() as *mut _, ret_ptr as *mut _);
-                "#).unwrap();
+            (api.godot_method_bind_ptrcall)(method_bind, self.this, argument_buffer.as_mut_ptr() as *mut _, ret_ptr as *mut _);"#
+                ).unwrap();
 
                 godot_handle_return_post(&mut output, &method.get_return_type());
             }
 
-            writeln!(output, r#"
-        }}
+            writeln!(output,
+r#"        }}
     }}"#).unwrap();
         }
 
+        writeln!(output,
+r#"
+    pub fn cast<T: GodotObject>(&self) -> Option<T> {{
+        object::godot_cast::<T>(self.this)
+    }}
+"#      ).unwrap();
+
         writeln!(output, r#"}}"#).unwrap();
+
+        if class.is_reference && class.instanciable {
+            writeln!(output,
+r#"
+impl Drop for {name} {{
+    fn drop(&mut self) {{
+        unsafe {{
+            if object::unref(self.this) {{
+                (::get_api().godot_object_destroy)(self.this);
+            }}
+        }}
+    }}
+}}
+"#,
+                name = class.name
+            ).unwrap();
+        }
     }
+}
+
+fn skip_method(name: &str) -> bool {
+    name == "free"
 }
 
 fn rust_safe_name(name: &str) -> &str {
@@ -415,9 +676,9 @@ fn godot_handle_argument_pre<W: Write>(w: &mut W, ty: &Ty, name: &str, arg: usiz
         | &Ty::Rect2
         | &Ty::Color
         => {
-            writeln!(w, r#"
-            argument_buffer[{arg}] = (&{name}) as *const _ as *const _;
-            "#, name = name, arg = arg).unwrap();
+            writeln!(w,
+r#"            argument_buffer[{arg}] = (&{name}) as *const _ as *const _;"#,
+            name = name, arg = arg).unwrap();
         },
         &Ty::Variant
         | &Ty::String
@@ -433,9 +694,10 @@ fn godot_handle_argument_pre<W: Write>(w: &mut W, ty: &Ty, name: &str, arg: usiz
         | &Ty::Int32Array
         | &Ty::Float32Array
         => {
-            writeln!(w, r#"
-            argument_buffer[{arg}] = (&{name}.0) as *const _ as *const _;
-            "#, name = name, arg = arg).unwrap();
+            writeln!(w,
+r#"            argument_buffer[{arg}] = (&{name}.0) as *const _ as *const _;"#,
+                name = name, arg = arg
+            ).unwrap();
         },
         &Ty::Object(_) => {
             writeln!(w, r#"
@@ -454,27 +716,27 @@ fn godot_handle_return_pre<W: Write>(w: &mut W, ty: &Ty) {
     match ty {
         &Ty::Void => {
             writeln!(w, r#"
-            let ret_ptr = ptr::null_mut();
-            "#).unwrap();
+            let ret_ptr = ptr::null_mut();"#
+            ).unwrap();
 
         },
         &Ty::F64 => {
             writeln!(w, r#"
             let mut ret = 0.0f64;
-            let ret_ptr = &mut ret as *mut _;
-            "#).unwrap();
+            let ret_ptr = &mut ret as *mut _;"#
+            ).unwrap();
         },
         &Ty::I64 => {
             writeln!(w, r#"
             let mut ret = 0i64;
-            let ret_ptr = &mut ret as *mut _;
-            "#).unwrap();
+            let ret_ptr = &mut ret as *mut _;"#
+            ).unwrap();
         },
         &Ty::Bool => {
             writeln!(w, r#"
             let mut ret = false;
-            let ret_ptr = &mut ret as *mut _;
-            "#).unwrap();
+            let ret_ptr = &mut ret as *mut _;"#
+            ).unwrap();
         },
         &Ty::String
         | &Ty::Vector2
@@ -501,28 +763,28 @@ fn godot_handle_return_pre<W: Write>(w: &mut W, ty: &Ty) {
         => {
             writeln!(w, r#"
             let mut ret = {sys_ty}::default();
-            let ret_ptr = &mut ret as *mut _;
-            "#, sys_ty = ty.to_sys().unwrap()
+            let ret_ptr = &mut ret as *mut _;"#,
+                sys_ty = ty.to_sys().unwrap()
             ).unwrap();
         }
         &Ty::Object(_) // TODO: double check
         | &Ty::Rid => {
             writeln!(w, r#"
             let mut ret: *mut sys::godot_object = ptr::null_mut();
-            let ret_ptr = (&mut ret) as *mut _;
-            "#).unwrap();
+            let ret_ptr = (&mut ret) as *mut _;"#
+            ).unwrap();
         }
         &Ty::Result => {
             writeln!(w, r#"
             let mut ret: sys::godot_error = sys::godot_error::GODOT_OK;
-            let ret_ptr = (&mut ret) as *mut _;
-            "#).unwrap();
+            let ret_ptr = (&mut ret) as *mut _;"#
+            ).unwrap();
         }
         &Ty::VariantType => {
             writeln!(w, r#"
             let mut ret: sys::godot_variant_type = sys::godot_variant_type::GODOT_VARIANT_TYPE_NIL;
-            let ret_ptr = (&mut ret) as *mut _;
-            "#).unwrap();
+            let ret_ptr = (&mut ret) as *mut _;"#
+            ).unwrap();
         }
         &Ty::Enum(_) => {}
     }
@@ -534,7 +796,11 @@ fn godot_handle_return_post<W: Write>(w: &mut W, ty: &Ty) {
         &Ty::F64
         | &Ty::I64
         | &Ty::Bool
-        => { writeln!(w, "ret").unwrap(); }
+        => {
+            writeln!(w,
+r#"            ret"#
+            ).unwrap();
+        }
         &Ty::Vector2
         | &Ty::Vector3
         | &Ty::Transform
@@ -546,14 +812,16 @@ fn godot_handle_return_post<W: Write>(w: &mut W, ty: &Ty) {
         | &Ty::Plane
         | &Ty::Color
         => {
-            writeln!(w, "::std::mem::transmute(ret)").unwrap();
+            writeln!(w,
+r#"             mem::transmute(ret)"#
+            ).unwrap();
         },
         &Ty::Rid => {
-            writeln!(w, r#"
-            let mut rid = Rid::default();
+            writeln!(w,
+r#"            let mut rid = Rid::default();
             (api.godot_rid_new_with_resource)(&mut rid.0, ret);
-            rid
-            "#).unwrap();
+            rid "#
+            ).unwrap();
         },
         &Ty::String
         | &Ty::NodePath
@@ -568,9 +836,8 @@ fn godot_handle_return_post<W: Write>(w: &mut W, ty: &Ty) {
         | &Ty::Float32Array
         | &Ty::Variant
         => {
-            writeln!(w, r#"
-            {rust_ty}(ret)
-            "#, rust_ty = ty.to_rust().unwrap()
+            writeln!(w,
+r#"            {rust_ty}(ret)"#, rust_ty = ty.to_rust().unwrap()
             ).unwrap();
         }
         &Ty::Object(ref name) => {
@@ -578,19 +845,20 @@ fn godot_handle_return_post<W: Write>(w: &mut W, ty: &Ty) {
             if ret.is_null() {{
                 None
             }} else {{
-                Some(GodotRef::<{}>::from_object(ret))
-            }}
-            "#, name).unwrap();
+                Some({}::from_sys(ret))
+            }}"#,
+                name
+            ).unwrap();
         },
         &Ty::Result => {
-            writeln!(w, r#"
-            result_from_sys(ret)
-            "#).unwrap();
+            writeln!(w,
+r#"            result_from_sys(ret)"#
+            ).unwrap();
         }
         &Ty::VariantType => {
-            writeln!(w, r#"
-            VariantType::from_sys(ret)
-            "#).unwrap();
+            writeln!(w,
+r#"            VariantType::from_sys(ret)"#
+            ).unwrap();
         }
         _ => {}
     }
@@ -600,8 +868,10 @@ fn godot_handle_return_post<W: Write>(w: &mut W, ty: &Ty) {
 struct GodotClass {
     name: String,
     base_class: String,
+    api_type: String,
     singleton: bool,
     is_reference: bool,
+    instanciable: bool,
 
     methods: Vec<GodotMethod>,
     enums: Vec<Enum>,
@@ -629,6 +899,16 @@ struct GodotMethod {
 }
 
 impl GodotMethod {
+    fn get_name(&self) -> &str {
+        // GDScript and NativeScript have ::new methods but we want to reserve
+        // the name for the constructors.
+        if &self.name == "new" {
+            return "_new";
+        }
+
+        &self.name
+    }
+
     fn get_return_type(&self) -> Ty {
         Ty::from_src(&self.return_type)
     }
@@ -646,5 +926,23 @@ struct GodotArgument {
 impl GodotArgument {
     fn get_type(&self) -> Ty {
         Ty::from_src(&self.ty)
+    }
+}
+
+fn class_name_to_snake_case(name: &str) -> String {
+    // TODO: this is a quick-n-dirty band-aid, it'd be better to
+    // programmatically do the right conversion, but to_snale_case
+    // currently translates "Node2D" into "node2_d".
+    match name {
+        "SpriteBase3D" => "sprite_base_3d".to_string(),
+        "Node2D" => "node_2d".to_string(),
+        "CollisionObject2D" => "collision_object_2d".to_string(),
+        "PhysicsBody2D" => "physics_body_2d".to_string(),
+        "VisibilityNotifier2D" => "visibility_notifier_2d".to_string(),
+        "Joint2D" => "joint_2d".to_string(),
+        "Shape2D" => "shape_2d".to_string(),
+        "Physics2DServer" => "physics_2d_server".to_string(),
+        "Physics2DDirectBodyState" => "physics_2d_direct_body_state".to_string(),
+        _ => name.to_snake_case(),
     }
 }

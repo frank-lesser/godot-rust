@@ -1,118 +1,154 @@
-use libc;
-use sys;
 use std::ops::Deref;
+use std::marker::PhantomData;
+use std::cell::RefCell;
+use std::mem;
+use sys;
 use GodotString;
+use GodotObject;
+use Object;
+use NativeScript;
+use object;
+use get_api;
 
-#[macro_export]
-#[doc(hidden)]
-macro_rules! godot_class_count_params {
-    () => (0);
-    ($name:ident, $($other:ident,)*) => (
-        1 + godot_class_count_params!($($other,)*)
-    )
+/// Godot native class implementation detail that must be stored
+/// in each instance.
+pub struct NativeInstanceHeader {
+    #[doc(hidden)]
+    pub this: *mut sys::godot_object,
+}
+
+pub trait NativeClass {
+    fn class_name() -> &'static str;
+
+    fn get_header(&self) -> &NativeInstanceHeader;
+
+    fn as_object(&self) -> &Object {
+        unsafe {
+            mem::transmute(self.get_header())
+        }
+    }
+}
+
+/// A reference to a rust native script.
+pub struct NativeRef<T: NativeClass> {
+    this: *mut sys::godot_object,
+    _marker: PhantomData<T>,
+}
+
+impl<T: NativeClass> NativeRef<T> {
+    /// Try to down-cast from a `NativeScript` reference.
+    pub fn from_native_script(script: &NativeScript) -> Option<Self> {
+        // TODO: There's gotta be a better way.
+        let class = script.get_class_name();
+        let gd_name = GodotString::from_str(T::class_name());
+
+        if class != gd_name {
+            return None;
+        }
+
+        unsafe {
+            let this = script.to_sys();
+            object::add_ref(this);
+
+            return Some(NativeRef { this, _marker: PhantomData, });
+        }
+    }
+
+    /// Try to down-cast from an `Object` reference.
+    pub fn from_object(&self, obj: &Object) -> Option<Self> {
+        if let Some(script) = obj.get_script().and_then(|v| v.cast::<NativeScript>()) {
+            return Self::from_native_script(&script)
+        }
+
+        None
+    }
+
+    /// Up-cast to a `NativeScript` reference.
+    pub fn to_native_script(&self) -> NativeScript {
+        unsafe {
+            NativeScript::from_sys(self.this)
+        }
+    }
+
+    /// Try to cast into a godot object reference.
+    pub fn cast<O>(&self) -> Option<O> where O: GodotObject {
+        object::godot_cast::<O>(self.this)
+    }
+
+    /// Creates a new reference to the same object.
+    pub fn new_ref(&self) -> Self {
+        unsafe {
+            object::add_ref(self.this);
+
+            Self {
+                this: self.this,
+                _marker: PhantomData,
+            }
+        }
+    }
+
+    fn get_impl(&self) -> &RefCell<T> {
+        unsafe {
+            let api = get_api();
+            let ud = (api.godot_nativescript_get_userdata)(self.this);
+            &*(ud as *const _ as *const RefCell<T>)
+        }
+    }
+}
+
+impl<T: NativeClass> Deref for NativeRef<T> {
+    type Target = RefCell<T>;
+    fn deref(&self) -> &Self::Target {
+        self.get_impl()
+    }
+}
+
+impl <T: NativeClass> Drop for NativeRef<T> {
+    fn drop(&mut self) {
+        unsafe {
+            if object::unref(self.this) {
+                (get_api().godot_object_destroy)(self.this);
+            }
+        }
+    }
 }
 
 #[macro_export]
 #[doc(hidden)]
 macro_rules! godot_class_build_export_methods {
-    ($classty:ty, $class:ident, $desc:ident,) => ();
-    ($classty:ty, $class:ident, $desc:ident,
+    ($classty:ty, $builder:ident,) => ();
+
+    ($classty:ty, $builder:ident,
         export fn $name:ident(
             &mut self
             $(,$pname:ident : $pty:ty)*
         ) $body:block
         $($tt:tt)*
     ) => (
-        godot_class_build_export_methods!($classty, $class, $desc,
+        godot_class_build_export_methods!($classty, $builder,
             export fn $name(&mut self $(,$pname : $pty)*) -> () $body
             $($tt)*
         );
     );
-    ($classty:ty, $class:ident, $desc:ident,
+
+    ($classty:ty, $builder:ident,
         export fn $name:ident(
             &mut self
             $(,$pname:ident : $pty:ty)*
         ) -> $retty:ty $body:block
         $($tt:tt)*
     ) => (
-        {
-            #[allow(unused_assignments, unused_unsafe, dead_code, unused_variables, unused_mut)]
-            extern "C" fn godot_invoke(
-                _obj: *mut $crate::sys::godot_object,
-                _md: *mut $crate::libc::c_void,
-                ud: *mut $crate::libc::c_void,
-                num_args: $crate::libc::c_int,
-                args: *mut *mut $crate::sys::godot_variant
-            ) -> $crate::sys::godot_variant {
-                use std::cell::RefCell;
-                use std::panic::{self, AssertUnwindSafe};
-                unsafe {
-                    let api = $crate::get_api();
-
-                    let num_params = godot_class_count_params!($($pname,)*);
-                    if num_args < num_params {
-                        godot_error!("Incorrect number of parameters: got {} and wanted {}", num_args, num_params);
-                        let mut ret = $crate::sys::godot_variant::default();
-                        (api.godot_variant_new_nil)(&mut ret);
-                        return ret;
-                    }
-                    let mut offset = 0;
-                    $(
-                        let $pname = if let Some(val) = <$pty as $crate::GodotType>::from_sys_variant(&mut *(*args).offset(offset)) {
-                            val
-                        } else {
-                            godot_error!("Incorrect parameter type for parameter {}", offset);
-                            let mut ret = $crate::sys::godot_variant::default();
-                            (api.godot_variant_new_nil)(&mut ret);
-                            return ret;
-                        };
-                        offset += 1;
-                    )*
-                    let __rust_ty = &*(ud as *mut RefCell<$classty>);
-                    let mut __rust_ty = __rust_ty.borrow_mut();
-                    let rust_ret = match panic::catch_unwind(AssertUnwindSafe(|| {
-                        __rust_ty.$name($(
-                            $pname
-                        ),*);
-                    })) {
-                        Ok(val) => val,
-                        Err(err) => {
-                            let err = if let Some(err) = err.downcast_ref::<&str>() {
-                                (*err).to_owned()
-                            } else if let Some(err) = err.downcast_ref::<String>() {
-                                (*err).clone()
-                            } else {
-                                "Unknown".to_owned()
-                            };
-                            godot_error!("Method call failed, everything may be in an invalid state: {:?}", err);
-                            let mut ret = $crate::sys::godot_variant::default();
-                            (api.godot_variant_new_nil)(&mut ret);
-                            return ret;
-                        }
-                    };
-                    <$retty as $crate::GodotType>::to_variant(&rust_ret).forget()
-                }
-            }
-            let method = $crate::sys::godot_instance_method {
-                method: Some(godot_invoke),
-                method_data: ::std::ptr::null_mut(),
-                free_func: None,
-            };
-            let attr = $crate::sys::godot_method_attributes {
-                rpc_type: $crate::sys::godot_method_rpc_mode::GODOT_METHOD_RPC_MODE_DISABLED,
-            };
-            let name = CString::new(stringify!($name)).unwrap();
-            ($crate::get_api().godot_nativescript_register_method)(
-                $desc as *mut _,
-                $class.as_ptr() as *const _,
-                name.as_ptr() as *const _,
-                attr,
-                method
-            );
-        }
-        godot_class_build_export_methods!($classty, $class, $desc, $($tt)*);
-    )
+        $builder.add_method(
+            stringify!($name),
+            godot_wrap_method!(
+                $classty,
+                fn $name(&mut self $(,$pname : $pty)* ) -> $retty
+            ),
+        );
+        godot_class_build_export_methods!($classty, $builder, $($tt)*);
+    );
 }
+
 #[macro_export]
 #[doc(hidden)]
 macro_rules! godot_class_build_methods {
@@ -143,6 +179,46 @@ macro_rules! godot_class_build_methods {
     )
 }
 
+/// Convenience macro to declare a native class.
+///
+/// ## Example
+///
+/// ```ignore
+/// godot_class! {
+///    class HelloWorld: godot::Node {
+///        fields {
+///            x: f32,
+///        }
+///
+///        setup(builder) {
+///            builder.add_property(
+///                Property {
+///                    name: "base/x",
+///                    default: 1.0,
+///                    hint: PropertyHint::Range {
+///                        range: 0.0..1.0,
+///                        step: 0.01,
+///                        slider: true
+///                    },
+///                    getter: |this: &mut RustTest| this.x,
+///                    setter: |this: &mut RustTest, v| this.x = v,
+///                    usage: PropertyUsage::DEFAULT,
+///                }
+///            );
+///        }
+///
+///        constructor(header) {
+///            HelloWorld {
+///                header,
+///            }
+///        }
+///
+///        export fn _ready(&mut self) {
+///            godot_print!("hello, world.");
+///        }
+///    }
+/// }
+/// ```
 #[macro_export]
 macro_rules! godot_class {
     (
@@ -154,13 +230,13 @@ class $name:ident: $parent:ty {
         )*
     }
     setup($builder:ident) $pbody:block
-    constructor($godot_info:ident) $construct:block
+    constructor($header:ident) $construct:block
 
     $($tt:tt)*
 }
     ) => (
         pub struct $name {
-            godot_info: $crate::GodotClassInfo,
+            header: $crate::NativeInstanceHeader,
             $(
                 $(#[$fattr])*
                 pub $fname: $fty,
@@ -170,42 +246,23 @@ class $name:ident: $parent:ty {
         impl $name {
             godot_class_build_methods!($($tt)*);
 
-            pub fn godot_parent(&self) -> $crate::GodotRef<$parent> {
+            pub fn as_parent(&self) -> $parent {
                 unsafe {
-                    $crate::GodotRef::from_raw(self.godot_info.this)
+                    <$parent as $crate::GodotObject>::from_sys(self.header.this)
                 }
             }
-        }
 
-        unsafe impl $crate::GodotClass for $name {
-            type ClassData = ();
-            type Reference = ::std::cell::RefCell<$name>;
-            fn godot_name() -> &'static str {
-                stringify!($name)
-            }
-            fn godot_info(&self) -> &$crate::GodotClassInfo {
-                &self.godot_info
-            }
-            unsafe fn from_object(_obj: *mut $crate::sys::godot_object) -> Self::ClassData {
-                ()
-            }
-            unsafe fn reference(this: *mut $crate::sys::godot_object, _data: &Self::ClassData) -> &Self::Reference {
-                let api = $crate::get_api();
-                let ud = (api.godot_nativescript_get_userdata)(this);
-                &*(ud as *const _ as *const ::std::cell::RefCell<$name>)
-            }
-
-            unsafe fn register_class(desc: *mut $crate::libc::c_void) {
+            pub fn register_class(init_handle: $crate::init::InitHandle) {
                 use $crate::sys;
-                use std::ffi::CString;
-                use std::ptr;
-                fn constructor($godot_info : $crate::GodotClassInfo) -> $name {
+
+                fn constructor($header : $crate::NativeInstanceHeader) -> $name {
                     $construct
                 }
 
                 extern "C" fn godot_create(this: *mut sys::godot_object, _data: *mut $crate::libc::c_void) -> *mut $crate::libc::c_void {
                     use std::cell::RefCell;
-                    let val = constructor($crate::GodotClassInfo {
+
+                    let val = constructor($crate::NativeInstanceHeader {
                         this: this,
                     });
                     let wrapper = Box::new(RefCell::new(val));
@@ -217,230 +274,46 @@ class $name:ident: $parent:ty {
                     drop(wrapper);
                 }
 
-                let cname = CString::new(stringify!($name)).unwrap();
-                let pname = CString::new(
-                    <$parent as $crate::GodotClass>::godot_name()
-                ).unwrap();
-
-                let create = sys::godot_instance_create_func {
-                    create_func: Some(godot_create),
-                    method_data: ptr::null_mut(),
-                    free_func: None,
-                };
-
-                let destroy = sys::godot_instance_destroy_func {
-                    destroy_func: Some(godot_free),
-                    method_data: ptr::null_mut(),
-                    free_func: None,
-                };
-
-                ($crate::get_api().godot_nativescript_register_class)(
-                    desc as *mut _,
-                    cname.as_ptr() as *const _,
-                    pname.as_ptr() as *const _,
-                    create,
-                    destroy
+                let $builder = init_handle.add_class::<Self>(
+                    $crate::init::ClassDescriptor {
+                        name: stringify!($name),
+                        base_class: <$parent as $crate::GodotObject>::class_name(),
+                        constructor: Some(godot_create),
+                        destructor: Some(godot_free),
+                    }
                 );
 
-                godot_class_build_export_methods!($name, cname, desc, $($tt)*);
+                godot_class_build_export_methods!($name, $builder, $($tt)*);
 
-                let $builder: $crate::PropertyBuilder<$name>  = $crate::PropertyBuilder {
-                    desc: desc,
-                    class_name: cname.as_ptr() as *const _,
-                    _marker: ::std::marker::PhantomData,
-                };
                 $pbody
             }
+        }
+
+        impl $crate::NativeClass for $name {
+            fn class_name() -> &'static str { stringify!($name) }
+            fn get_header(&self) -> &$crate::NativeInstanceHeader { &self.header }
         }
     )
 }
 
-pub unsafe trait GodotClass {
-    type ClassData;
-    type Reference;
-
-    fn godot_name() -> &'static str;
-    fn godot_info(&self) -> &GodotClassInfo;
-    unsafe fn from_object(obj: *mut sys::godot_object) -> Self::ClassData;
-    unsafe fn register_class(desc: *mut libc::c_void);
-    unsafe fn reference(this: *mut sys::godot_object, data: &Self::ClassData) -> &Self::Reference;
-}
-
-pub struct GodotClassInfo {
-    #[doc(hidden)]
-    pub this: *mut sys::godot_object,
-}
-
-pub struct GodotRef<T: GodotClass> {
-    pub(crate) this: *mut sys::godot_object,
-    pub(crate) data: T::ClassData,
-    pub(crate) reference: bool,
-}
-
-macro_rules! call_bool {
-    ($obj:expr, $class:ident, $method:ident) => ({
-        use std::ptr;
-        use std::ffi;
-        use std::sync::{Once, ONCE_INIT};
-        #[allow(unused_unsafe)]
-        unsafe {
-            let api = ::get_api();
-            static mut METHOD_BIND: *mut sys::godot_method_bind = 0 as _;
-            static INIT: Once = ONCE_INIT;
-            INIT.call_once(|| {
-                let class = ffi::CString::new(stringify!($class)).unwrap();
-                let method = ffi::CString::new(stringify!($method)).unwrap();
-                METHOD_BIND = (api.godot_method_bind_get_method)(
-                    class.as_ptr() as *const _,
-                    method.as_ptr() as *const _
-                );
-            });
-
-            let mut argument_buffer = [ptr::null() as *const libc::c_void; 0];
-
-            let mut ret = false;
-            let ret_ptr = &mut ret as *mut _;
-            (api.godot_method_bind_ptrcall)(METHOD_BIND, $obj, argument_buffer.as_mut_ptr() as *mut _, ret_ptr as *mut _);
-            ret
-
+#[cfg(test)]
+godot_class! {
+    class TestClass: super::Node {
+        fields {
+            a: u32,
         }
-    })
-}
 
+        setup(_builder) {}
 
-impl <T> GodotRef<T>
-    where T: GodotClass
-{
-    pub unsafe fn from_object(obj: *mut sys::godot_object) -> GodotRef<T> {
-        let reference = Self::is_class(obj, "Reference");
-        if reference && !call_bool!(obj, Reference, init_ref) {
-            godot_error!("Failed to init reference");
-        }
-        GodotRef {
-            this: obj,
-            data: T::from_object(obj),
-            reference,
-        }
-    }
-
-    pub unsafe fn from_raw(obj: *mut sys::godot_object) -> GodotRef<T> {
-        GodotRef {
-            this: obj,
-            data: T::from_object(obj),
-            reference: false,
-        }
-    }
-
-    pub fn cast<O>(&self) -> Option<GodotRef<O>>
-        where O: GodotClass
-    {
-        if Self::is_class(self.this, O::godot_name()) {
-            Some(if self.reference {
-                call_bool!(self.this, Reference, reference);
-                GodotRef {
-                    this: self.this,
-                    data: unsafe { O::from_object(self.this) },
-                    reference: true,
-                }
-            } else {
-                GodotRef {
-                    this: self.this,
-                    data: unsafe { O::from_object(self.this) },
-                    reference: false,
-                }
-            })
-        } else {
-            None
-        }
-    }
-
-    pub fn cast_native<O>(&self) -> Option<GodotRef<O>>
-        where O: GodotClass
-    {
-        let obj: GodotRef<::Object> = GodotRef {
-            this: self.this,
-            data: unsafe { ::Object::from_object(self.this) },
-            reference: false,
-        };
-        if let Some(script) = obj.get_script().and_then(|v| v.cast::<::NativeScript>()) {
-            let class = script.get_class_name();
-            // TODO: it would be good to cache the class name as a godot string
-            // somewhere to avoid creating it every time.
-            let gd_name = GodotString::from_str(O::godot_name());
-            if class == gd_name {
-                Some(if self.reference {
-                    call_bool!(self.this, Reference, reference);
-                    GodotRef {
-                        this: self.this,
-                        data: unsafe { O::from_object(self.this) },
-                        reference: true,
-                    }
-                } else {
-                    GodotRef {
-                        this: self.this,
-                        data: unsafe { O::from_object(self.this) },
-                        reference: false,
-                    }
-                })
-            } else {
-                None
+        constructor(header) {
+            TestClass {
+                header,
+                a: 42,
             }
-        } else {
-            None
         }
-    }
 
-    fn is_class(obj: *mut sys::godot_object, name: &str) -> bool {
-        use std::ptr;
-        use std::ffi;
-        use std::sync::{Once, ONCE_INIT};
-        unsafe {
-            let api = ::get_api();
-            static mut METHOD_BIND: *mut sys::godot_method_bind = 0 as _;
-            static INIT: Once = ONCE_INIT;
-            INIT.call_once(|| {
-                let class = ffi::CString::new("Object").unwrap();
-                let method = ffi::CString::new("is_class").unwrap();
-                METHOD_BIND = (api.godot_method_bind_get_method)(
-                    class.as_ptr() as *const _,
-                    method.as_ptr() as *const _
-                );
-            });
-
-            let mut argument_buffer = [ptr::null() as *const libc::c_void; 1];
-
-            let mut godot_name = (api.godot_string_chars_to_utf8_with_len)(name.as_ptr() as *const _, name.len() as _);
-            argument_buffer[0] = (&godot_name) as *const _ as *const _;
-
-            let mut ret = false;
-            let ret_ptr = &mut ret as *mut _;
-            (api.godot_method_bind_ptrcall)(METHOD_BIND, obj, argument_buffer.as_mut_ptr() as *mut _, ret_ptr as *mut _);
-            (api.godot_string_destroy)(&mut godot_name);
-            ret
-
-        }
-    }
-}
-
-
-impl <T> Deref for GodotRef<T>
-    where T: GodotClass
-{
-    type Target = T::Reference;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe {
-            T::reference(self.this, &self.data)
-        }
-    }
-}
-
-impl <T: GodotClass> Drop for GodotRef<T> {
-    fn drop(&mut self) {
-        if self.reference && call_bool!(self.this, Reference, unreference) {
-            unsafe {
-                (::get_api().godot_object_destroy)(self.this);
-            }
+        export fn _ready(&mut self) {
+            godot_print!("hello, world.");
         }
     }
 }
